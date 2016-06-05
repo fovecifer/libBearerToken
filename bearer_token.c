@@ -13,6 +13,9 @@ static char *TYP = "typ";
 static char *ALG = "alg";
 static char *JWT = "JWT";
 static char *KID = "kid";
+static char *ISS = "iss";
+static char *SUB = "sub";
+static char *AUD = "aud";
 
 typedef struct _base64_url_hash {
     char *hash;
@@ -125,9 +128,8 @@ static void base64_encode(const char *restrict in, size_t inlen,
         *out = '\0';
 }
 
-static size_t url_base64_length(char *hash) {
+static size_t url_base64_length(char *hash, size_t length) {
     int i;
-    size_t length = strlen(hash);
     for(i = 0; i < length; i++) {
         if(hash[i] == '=') {
             break;
@@ -423,6 +425,26 @@ static void update_JOSE_header(bearer_token_t *token) {
     json_object_object_add(token->JOSE_header, KID, json_object_new_string(token->kid));
 }
 
+static int generate_JOSE_header_hash(bearer_token_t *token) {
+    base64_url_hash_t *base64_url_hash = (base64_url_hash_t *) calloc(sizeof(base64_url_hash_t), 1);
+    if(base64_url_hash == NULL) {
+        return ENOMEM;
+    }
+    char *JOSE_header_str = json_object_to_json_string_ext(token->JOSE_header, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+    size_t JOSE_header_str_len = strlen(JOSE_header_str);
+    size_t JOSE_header_base64_len = BASE64_LENGTH(JOSE_header_str_len);
+    
+    char *JOSE_header_hash = (char *)calloc(sizeof(char) * JOSE_header_base64_len, 1);
+    base64_encode(JOSE_header_str, JOSE_header_str_len, JOSE_header_hash, JOSE_header_base64_len);
+    
+    base64_url_hash->hash = JOSE_header_hash;
+    base64_url_hash->size = url_base64_length(JOSE_header_hash, JOSE_header_base64_len);
+    
+    token->Claim_set_hash = base64_url_hash;
+    
+    return 0;
+}
+
 int bearer_token_init(bearer_token_t *token) {
     update_JOSE_header(token);
 }
@@ -434,6 +456,18 @@ int bearer_token_set_expiration(bearer_token_t *token, int64_t expiration) {
     
     token->expiration = experation;
     return 0;
+}
+
+int bearer_token_set_iss(bearer_token_t *token, char *iss) {
+    return json_object_object_add(token->Claim_set, ISS, json_object_new_string(iss));
+}
+
+int bearer_token_set_sub(bearer_token_t *token, char *sub) {
+    return json_object_object_add(token->Claim_set, SUB, json_object_new_string(sub));
+}
+
+int bearer_token_set_aud(bearer_token_t *token, char *aud) {
+    return json_object_object_add(token->Claim_set, AUD, json_object_new_string(aud));
 }
 
 
