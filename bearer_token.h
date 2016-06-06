@@ -46,6 +46,8 @@ int bearer_token_set_aud(bearer_token_t *token, char *aud);
 
 int bearer_token_add_access(bearer_token_t *token, char *type, char *name, int actions);
 
+int bearer_token_del_all_access(bearer_token_t *token);
+
 int bearer_token_dump_string(bearer_token_t *token, char **out);
 
 void bearer_token_free(bearer_token_t *token);

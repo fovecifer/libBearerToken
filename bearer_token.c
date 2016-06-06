@@ -358,6 +358,9 @@ int bearer_token_set_pk_file_name(bearer_token_t *token, const char *pk_name) {
     struct stat tmp;
     int ret = stat(pk_name, &tmp);
     if(ret == 0) {
+        if(token->prk_file != NULL) {
+            fclose(token->prk_file);
+        }
         token->prk_file = fopen(pk_name, "r");
     }
     return ret;
@@ -383,6 +386,9 @@ static int rsa_generate_kid(bearer_token_t *token, RSA *tmp_rsa) {
         return ENOMEM;
     }
     base32_kid_encode(hash, base32_kid_hash);
+    if(token->kid != NULL) {
+        free(token->kid);
+    }
     token->kid = base32_kid_hash;
     
     if (out != NULL) {
@@ -395,6 +401,10 @@ static int rsa_generate_kid(bearer_token_t *token, RSA *tmp_rsa) {
 int bearer_token_load_pk(bearer_token_t *token) {
     if(token->prk_file == NULL) {
         return ENOENT;
+    }
+    
+    if(token->prk != NULL) {
+        EVP_PKEY_free(token->prk);
     }
     
     /* read private key */
@@ -411,6 +421,9 @@ int bearer_token_load_pk(bearer_token_t *token) {
         RSA *tmp_rsa = EVP_PKEY_get1_RSA(tmp_prk);
         if(tmp_rsa == NULL) {
             return EPERM;
+        }
+        if(token->pk.rsa != NULL) {
+            RSA_free(token->pk.rsa);
         }
         token->pk.rsa = tmp_rsa;
         return rsa_generate_kid(token, tmp_rsa);
@@ -434,7 +447,15 @@ static const char *alg_to_str(jwt_alg_t alg)
 	return NULL; // LCOV_EXCL_LINE
 }
 
+static void base64_url_hash_free(base64_url_hash_t *hash) {
+    if(hash->hash != NULL) {
+        free(hash->hash);
+    }
+    free(hash);
+}
+
 static void update_JOSE_header(bearer_token_t *token) {
+    
     json_object_object_add(token->JOSE_header, TYP, json_object_new_string(JWT));
     json_object_object_add(token->JOSE_header, ALG, json_object_new_string(alg_to_str(token->alg)));
     json_object_object_add(token->JOSE_header, KID, json_object_new_string(token->kid));
@@ -506,6 +527,18 @@ int bearer_token_add_access(bearer_token_t *token, char *type, char *name, int a
     return 0;
 }
 
+int bearer_token_del_all_access(bearer_token_t *token) {
+    int length = json_object_array_length(token->accesses);
+    if(length == 0) {
+        return 0;
+    }
+    int ret = json_object_put(token->accesses);
+    if(ret != 1) {
+        return -1;
+    }
+    token->accesses = json_object_new_array();
+}
+
 static int generate_jti(int random, unsigned char *hash, size_t len) {
     unsigned char r[20];
     int i;
@@ -545,6 +578,9 @@ static int generate_Claim_set_hash(bearer_token_t *token) {
     base64_url_hash->hash = Claim_set_hash;
     base64_url_hash->size = url_base64_length(Claim_set_hash, Claim_set_base64_len);
     
+    if(token->Claim_set_hash != NULL) {
+        base64_url_hash_free(token->Claim_set_hash);
+    }
     token->Claim_set_hash = base64_url_hash;
     
     return 0;
@@ -608,13 +644,24 @@ int bearer_token_dump_string(bearer_token_t *token, char **out) {
     size_t sign_len;
     size_t token_str_len;
     int ret;
+    json_bool exist;
+    json_object *exist_value;
     /* prepare Claim set */
     time_t current = time(NULL);
     /* Not Before, nbf */
+    if(exist = json_object_object_get_ex(token->Claim_set, NBF, &exist_value)) {
+        json_object_object_del(token->Claim_set, NBF);
+    }
     json_object_object_add(token->Claim_set, NBF, json_object_new_int64(current - 10));
     /* Issued At, iat */
+    if(exist = json_object_object_get_ex(token->Claim_set, IAT, &exist_value)) {
+        json_object_object_del(token->Claim_set, IAT);
+    }
     json_object_object_add(token->Claim_set, IAT, json_object_new_int64(current));
     /* Expiration, exp */
+    if(exist = json_object_object_get_ex(token->Claim_set, EXP, &exist_value)) {
+        json_object_object_del(token->Claim_set, EXP);
+    }
     json_object_object_add(token->Claim_set, EXP, json_object_new_int64(current + token->expiration));
     
     /* generate jti */
@@ -622,6 +669,9 @@ int bearer_token_dump_string(bearer_token_t *token, char **out) {
     int r = rand();
     unsigned char rid[SHA256_DIGEST_LENGTH << 1];
     generate_jti(r, rid, SHA256_DIGEST_LENGTH << 1);
+    if(exist = json_object_object_get_ex(token->Claim_set, JTI, &exist_value)) {
+        json_object_object_del(token->Claim_set, JTI);
+    }
     json_object_object_add(token->Claim_set, JTI, json_object_new_string(rid));
     
     /*generate Claim set hash*/
@@ -654,6 +704,9 @@ int bearer_token_dump_string(bearer_token_t *token, char **out) {
     memcpy(token_str + cursor, signature, sign_len);
     token_str[token_str_len] = 0;
     
+    if(exist = json_object_object_get_ex(token->token, TOKEN, &exist_value)) {
+        json_object_object_del(token->Claim_set, TOKEN);
+    }
     json_object_object_add(token->token, TOKEN, json_object_new_string(token_str));
     
     /* free signature */
@@ -661,13 +714,6 @@ int bearer_token_dump_string(bearer_token_t *token, char **out) {
     
     *out = json_object_to_json_string_ext(token->token, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
     return 0;
-}
-
-static void base64_url_hash_free(base64_url_hash_t *hash) {
-    if(hash->hash != NULL) {
-        free(hash->hash);
-    }
-    free(hash);
 }
 
 void bearer_token_free(bearer_token_t *token) {
@@ -691,6 +737,10 @@ void bearer_token_free(bearer_token_t *token) {
     json_object_put(token->accesses);
     /* free token */
     json_object_put(token->token);
+    /* free pk */
+    if(token->alg == JWT_ALG_RS256) {
+        RSA_free(token->pk.rsa);
+    }
     
     free(token);
 }
