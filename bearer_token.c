@@ -27,6 +27,7 @@ static char *NAME = "name";
 static char *ACTIONS = "actions";
 static char *PULL = "pull";
 static char *PUSH = "push";
+static char *TOKEN = "token";
 
 typedef struct _base64_url_hash {
     char *hash;
@@ -48,8 +49,8 @@ struct _bearer_token {
     char *kid;
     json_object *JOSE_header;
     base64_url_hash_t *JOSE_header_hash;
-    json_object *Claim_set;
     int64_t expiration;
+    json_object *Claim_set;
     base64_url_hash_t *Claim_set_hash;
     json_object *accesses;
     json_object *token;
@@ -546,7 +547,64 @@ static int generate_Claim_set_hash(bearer_token_t *token) {
     return 0;
 }
 
+static int generate_rsa_signature(bearer_token_t *token, char **signature, int *slen) {
+    char *tmp_sign = NULL;
+    
+    /* generate hash first */
+    if(token->alg == JWT_ALG_RS256) {
+        unsigned char pay_load_hash[SHA256_DIGEST_LENGTH];
+        SHA256_CTX sha256;
+        SHA256_Init(&sha256);
+        /* JOSE header */
+        SHA256_Update(&sha256, token->JOSE_header_hash->hash, token->JOSE_header_hash->size);
+        /* . */
+        SHA256_Update(&sha256, ".", 1);
+        /* Claim set */
+        SHA256_Update(&sha256, token->Claim_set_hash->hash, token->Claim_set_hash->size);
+        SHA256_Final(pay_load_hash, &sha256);
+        
+        /* sign */
+        unsigned char sign[256];
+        unsigned int sign_len;
+        RSA_sign(NID_sha256, pay_load_hash, SHA256_DIGEST_LENGTH, sign, &sign_len, token->pk.rsa);
+        if(sign_len != 256) {
+            return EINVAL;
+        }
+        /* base64 url encode */
+        char sign_hash[BASE64_LENGTH(256) + 1];
+        base64_url_encode(sign, 256, sign_hash, BASE64_LENGTH(256));
+        sign_hash[BASE64_LENGTH(256)] = 0;
+        
+        /* trailing "=" remove */
+        size_t url_safe_hash_len = url_base64_length(sign_hash, BASE64_LENGTH(256) + 1);
+        tmp_sign = (char *)calloc(sizeof(char) * url_safe_hash_len + 1, 1);
+        if(tmp_sign == NULL) {
+            return ENOMEM;
+        }
+        memcpy(tmp_sign, sign_hash, url_safe_hash_len);
+        tmp_sign[url_safe_hash_len - 1] = 0;
+        
+        *signature = tmp_sign;
+        *slen = url_safe_hash_len;
+        
+        return 0;
+    }
+}
+
+static int generate_signature(bearer_token_t *token, char **signature, int *slen) {
+    if(token->alg == JWT_ALG_RS256) {
+        return generate_rsa_signature(token, signature, slen);
+    }
+    
+    /* others, ES*** HS*** */
+    return EINVAL;
+}
+
 int bearer_token_dump_string(bearer_token_t *token, char **out) {
+    char *signature;
+    size_t sign_len;
+    size_t token_str_len;
+    int ret;
     /* prepare Claim set */
     time_t current = time();
     /* Not Before, nbf */
@@ -563,5 +621,72 @@ int bearer_token_dump_string(bearer_token_t *token, char **out) {
     generate_jti(r, rid, SHA256_DIGEST_LENGTH << 1);
     json_object_object_add(token->Claim_set, JTI, json_object_new_string(rid));
     
+    /* get the signature */
+    ret = generate_signature(token, &signature, &sign_len);
+    if(ret != 0) {
+        return EINVAL;
+    }
     
+    /* generate token string */
+    token_str_len = token->JOSE_header_hash->size + token->Claim_set_hash->size
+            + sign_len + 2;
+    char token_str[token_str_len + 1];
+    int cursor = 0;
+    /* copy JOSE header */
+    memcpy(token_str + cursor, token->JOSE_header_hash->hash, token->JOSE_header_hash->size);
+    cursor += token->JOSE_header_hash->size;
+    /* . */
+    token_str[cursor] = '.';
+    cursor += 1;
+    /* Claim set */
+    memcpy(token_str + cursor, token->Claim_set_hash->hash, token->Claim_set_hash->size);
+    cursor += token->Claim_set_hash->size;
+    /* . */
+    token_str[cursor] = '.';
+    cursor += 1;
+    /* Signature */
+    memcpy(token_str + cursor, signature, sign_len);
+    token_str[token_str_len] = 0;
+    
+    json_object_object_add(token->token, TOKEN, json_object_new_string(token_str));
+    
+    /* free signature */
+    free(signature);
+    
+    *out = json_object_to_json_string_ext(token->token, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+    return 0;
 }
+
+static void base64_url_hash_free(base64_url_hash_t *hash) {
+    if(hash->hash != NULL) {
+        free(hash->hash);
+    }
+    free(hash);
+}
+
+void bearer_token_free(bearer_token_t *token) {
+    /* close prk file */
+    fclose(token->prk_file);
+    /* free EVP_PKEY */
+    EVP_PKEY_free(token->prk);
+    /* free kid */
+    if(token->kid != NULL) {
+        free(token->kid);
+    }
+    /* free JOSE_header */
+    json_object_put(token->JOSE_header);
+    /* free JOSE_header_hash */
+    base64_url_hash_free(token->JOSE_header_hash);
+    /* free Claim_set */
+    json_object_put(token->Claim_set);
+    /* free Claim_set_hash */
+    base64_url_hash_free(token->Claim_set_hash);
+    /* free accesses */
+    json_object_put(token->accesses);
+    /* free token */
+    json_object_put(token->token);
+    
+    free(token);
+}
+
+
