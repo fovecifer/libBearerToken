@@ -4,10 +4,13 @@
 #include <openssl/dh.h>
 #include <openssl/ec.h>
 #include <openssl/sha.h>
+#include <openssl/pem.h>
 #include <stdint.h>
 #include <assert.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <errno.h>
+#include <string.h>
 
 static int KID_LENGTH = 60;
 static char *TYP = "typ";
@@ -55,6 +58,10 @@ struct _bearer_token {
     json_object *accesses;
     json_object *token;
 };
+
+/* This uses that the expression (n+(k-1))/k means the smallest
+   integer >= n/k, i.e., the ceiling of n/k.  */
+#define BASE64_LENGTH(inlen) ((((inlen) + 2) / 3) * 4)
 
 /* C89 compliant way to cast 'char' to 'unsigned char'. */
 static unsigned char
@@ -356,38 +363,6 @@ int bearer_token_set_pk_file_name(bearer_token_t *token, const char *pk_name) {
     return ret;
 }
 
-int bearer_token_load_pk(bearer_token_t *token) {
-    if(token->prk_file == NULL) {
-        return ENOENT;
-    }
-    
-    EVP_PKEY *tmp_prk;
-    
-    
-    
-    /* read private key */
-    tmp_prk = PEM_read_PrivateKey(token->prk_file, &tmp_prk,
-            NULL, NULL);
-    if(tmp_prk == NULL) {
-        return EPERM;
-    }
-    token->prk = tmp_prk;
-    
-    
-    /* for RS*** alg */
-    if(token->alg == JWT_ALG_RS256) {
-        RSA *tmp_rsa = EVP_PKEY_get1_RSA(tmp_prk);
-        if(tmp_rsa == NULL) {
-            return EPERM;
-        }
-        token->pk.rsa = tmp_rsa;
-        return rsa_generate_kid(token, tmp_rsa);
-    }
-    
-    return 0;
-    
-}
-
 static int rsa_generate_kid(bearer_token_t *token, RSA *tmp_rsa) {
     BIO *out = NULL;
     int ret;
@@ -417,6 +392,34 @@ static int rsa_generate_kid(bearer_token_t *token, RSA *tmp_rsa) {
     return 0;
 }
 
+int bearer_token_load_pk(bearer_token_t *token) {
+    if(token->prk_file == NULL) {
+        return ENOENT;
+    }
+    
+    /* read private key */
+    EVP_PKEY *tmp_prk = PEM_read_PrivateKey(token->prk_file, &(token->prk),
+            NULL, NULL);
+    if(tmp_prk == NULL) {
+        return EPERM;
+    }
+    token->prk = tmp_prk;
+    
+    
+    /* for RS*** alg */
+    if(token->alg == JWT_ALG_RS256) {
+        RSA *tmp_rsa = EVP_PKEY_get1_RSA(tmp_prk);
+        if(tmp_rsa == NULL) {
+            return EPERM;
+        }
+        token->pk.rsa = tmp_rsa;
+        return rsa_generate_kid(token, tmp_rsa);
+    }
+    
+    return 0;
+    
+}
+
 static const char *alg_to_str(jwt_alg_t alg)
 {
 	switch (alg) {
@@ -442,7 +445,7 @@ static int generate_JOSE_header_hash(bearer_token_t *token) {
     if(base64_url_hash == NULL) {
         return ENOMEM;
     }
-    char *JOSE_header_str = json_object_to_json_string_ext(token->JOSE_header, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
+    const char *JOSE_header_str = json_object_to_json_string_ext(token->JOSE_header, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
     size_t JOSE_header_str_len = strlen(JOSE_header_str);
     size_t JOSE_header_base64_len = BASE64_LENGTH(JOSE_header_str_len);
     
@@ -467,7 +470,7 @@ int bearer_token_set_expiration(bearer_token_t *token, int64_t expiration) {
         return EINVAL;
     }
     
-    token->expiration = experation;
+    token->expiration = expiration;
     return 0;
 }
 
@@ -483,16 +486,16 @@ int bearer_token_set_aud(bearer_token_t *token, char *aud) {
     return json_object_object_add(token->Claim_set, AUD, json_object_new_string(aud));
 }
 
-int bearer_token_add_access(bearer_token_t *token, char *type, char *name, int actions) {
+int bearer_token_add_access(bearer_token_t *token, char *type, char *name, int actions_flag) {
     json_object *access = json_object_new_object();
     json_object_object_add(access, TYPE, json_object_new_string(type));
     json_object_object_add(access, NAME, json_object_new_string(name));
     
     json_object *actions = json_object_new_array();
-    if(actions & ACCESS_ACTION_PULL) {
+    if(actions_flag & ACCESS_ACTION_PULL) {
         json_object_array_add(actions, json_object_new_string(PULL));
     }
-    if(actions & ACCESS_ACTION_PUSH) {
+    if(actions_flag & ACCESS_ACTION_PUSH) {
         json_object_array_add(actions, json_object_new_string(PUSH));
     }
     
@@ -509,7 +512,7 @@ static int generate_jti(int random, unsigned char *hash, size_t len) {
     int hex_len = SHA256_DIGEST_LENGTH << 1;
     sprintf(r, "%019d", random);
     unsigned char sha256_hash[SHA256_DIGEST_LENGTH];
-    unsigned char sha256_hash_hex[];
+    unsigned char sha256_hash_hex[SHA256_DIGEST_LENGTH << 1];
     SHA256(r, 20, sha256_hash);
     for(i = 0; i < SHA256_DIGEST_LENGTH; i++) {
         sprintf(sha256_hash_hex + (i * 2), "%02x", sha256_hash[i]);
@@ -531,7 +534,7 @@ static int generate_Claim_set_hash(bearer_token_t *token) {
         return ENOMEM;
     }
     
-    char *Claim_set_str = json_object_to_json_string_ext(token->Claim_set, 
+    const char *Claim_set_str = json_object_to_json_string_ext(token->Claim_set, 
             JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE);
     size_t Claim_set_str_len = strlen(Claim_set_str);
     size_t Claim_set_base64_len = BASE64_LENGTH(Claim_set_str_len);
@@ -547,7 +550,7 @@ static int generate_Claim_set_hash(bearer_token_t *token) {
     return 0;
 }
 
-static int generate_rsa_signature(bearer_token_t *token, char **signature, int *slen) {
+static int generate_rsa_signature(bearer_token_t *token, char **signature, size_t *slen) {
     char *tmp_sign = NULL;
     
     /* generate hash first */
@@ -591,7 +594,7 @@ static int generate_rsa_signature(bearer_token_t *token, char **signature, int *
     }
 }
 
-static int generate_signature(bearer_token_t *token, char **signature, int *slen) {
+static int generate_signature(bearer_token_t *token, char **signature, size_t *slen) {
     if(token->alg == JWT_ALG_RS256) {
         return generate_rsa_signature(token, signature, slen);
     }
@@ -606,7 +609,7 @@ int bearer_token_dump_string(bearer_token_t *token, char **out) {
     size_t token_str_len;
     int ret;
     /* prepare Claim set */
-    time_t current = time();
+    time_t current = time(NULL);
     /* Not Before, nbf */
     json_object_object_add(token->Claim_set, NBF, json_object_new_int64(current - 10));
     /* Issued At, iat */
@@ -617,9 +620,12 @@ int bearer_token_dump_string(bearer_token_t *token, char **out) {
     /* generate jti */
     srand(time(NULL));
     int r = rand();
-    unsigned char *rid[SHA256_DIGEST_LENGTH << 1];
+    unsigned char rid[SHA256_DIGEST_LENGTH << 1];
     generate_jti(r, rid, SHA256_DIGEST_LENGTH << 1);
     json_object_object_add(token->Claim_set, JTI, json_object_new_string(rid));
+    
+    /*generate Claim set hash*/
+    generate_Claim_set_hash(token);
     
     /* get the signature */
     ret = generate_signature(token, &signature, &sign_len);
